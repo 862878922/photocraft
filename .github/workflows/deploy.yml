@@ -56,8 +56,8 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置 craft-i18n 词库并在源码层面彻底锁定中文默认值
-      - name: Prepare craft-i18n and Lock Chinese Default in Source
+      # 6. 下载 craft-i18n 仓库，深度汉化所有 TSV 词库并在源码与入口中锁定默认中文
+      - name: Prepare craft-i18n Catalogs and Enforce Chinese Everywhere
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
@@ -67,10 +67,10 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
-          cat << 'PYEOF' > setup_chinese.py
+          cat << 'PYEOF' > force_chinese.py
           import os, re, shutil
 
-          # 1. 深度配置 Cargo.toml 最小体积 Profile（不添加错误的 patch）
+          # 1. 深度配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -100,8 +100,7 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 为 craft-i18n 中所有包含 en 的路径生成 zh 目录与翻译条目
-          i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
+          # 2. 全盘汉化字典
           translations = {
               "File": "文件", "Open": "打开", "Open...": "打开...", "Save": "保存",
               "Save As": "另存为", "Save As...": "另存为...", "Export": "导出", "Print": "打印",
@@ -112,21 +111,19 @@ jobs:
               "Flip Horizontal": "水平翻转", "Flip Vertical": "垂直翻转", "Brightness": "亮度",
               "Contrast": "对比度", "Saturation": "饱和度", "Filters": "滤镜", "Zoom": "缩放",
               "Fit": "适应窗口", "Fit Width": "适应宽度", "Actual Size": "实际大小",
-              "English": "English", "Auto": "跟随系统", "System": "跟随系统",
+              "English": "简体中文", "Auto": "跟随系统", "System": "跟随系统",
               "Cancel": "取消", "OK": "确定", "Apply": "应用", "Reset": "重置",
-              "Undo": "撤销", "Redo": "重做", "Layers": "图层", "History": "历史记录"
+              "Undo": "撤销", "Redo": "重做", "Layers": "图层", "History": "历史记录",
+              "New": "新建", "New...": "新建...", "Export...": "导出...", "Import": "导入"
           }
 
+          # 3. 递归汉化 craft-i18n 下面的所有 TSV 文件（包括 en 和新增的 zh）
+          i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
           for root, dirs, files in os.walk(i18n_repo):
-              tsv_files = [f for f in files if f.endswith(".tsv")]
-              if tsv_files and os.path.basename(root) == "en":
-                  parent = os.path.dirname(root)
-                  zh_dir = os.path.join(parent, "zh")
-                  os.makedirs(zh_dir, exist_ok=True)
-                  for f in tsv_files:
-                      src_f = os.path.join(root, f)
-                      dst_f = os.path.join(zh_dir, f)
-                      with open(src_f, "r", encoding="utf-8", errors="ignore") as rf:
+              for f in files:
+                  if f.endswith(".tsv"):
+                      fp = os.path.join(root, f)
+                      with open(fp, "r", encoding="utf-8", errors="ignore") as rf:
                           lines = rf.readlines()
                       out = []
                       for line in lines:
@@ -134,16 +131,29 @@ jobs:
                           if len(p) >= 2:
                               en_t = p[1]
                               tr = translations.get(en_t, en_t)
-                              out.append(f"{p[0]}\t{en_t}\t{tr}\n")
+                              # 无论原本第二列是什么，把第三列和第四列全部替换为汉字
+                              if len(p) == 2:
+                                  out.append(f"{p[0]}\t{en_t}\t{tr}\n")
+                              else:
+                                  out.append(f"{p[0]}\t{en_t}\t{tr}\n")
                           else:
                               out.append(line)
-                      out.insert(0, "@id\tlanguage.name\t简体中文\n")
-                      with open(dst_f, "w", encoding="utf-8") as wf:
+                      with open(fp, "w", encoding="utf-8") as wf:
                           wf.writelines(out)
-                      print(f"✅ 生成 zh 词条文件: {dst_f}")
+                      print(f"✅ 汉化词条文件: {fp}")
 
-          # 3. 递归扫描 crates/ 源码，将首选项默认值与系统回退强制锁定为 zh
-          for root, _, files in os.walk("crates"):
+          # 同时将所有包含 tsv 的 en 文件夹直接完整克隆一份为 zh
+          for root, dirs, files in os.walk(i18n_repo):
+              if os.path.basename(root) == "en":
+                  zh_dir = os.path.join(os.path.dirname(root), "zh")
+                  if not os.path.exists(zh_dir):
+                      shutil.copytree(root, zh_dir)
+                      print(f"✅ 复制生成 zh 目录: {zh_dir}")
+
+          # 4. 递归穿透修改仓库里所有 .rs 源码文件，硬编码锁定中文
+          for root, _, files in os.walk("."):
+              if any(k in root for k in ["target", ".git", "dist", "craft-i18n"]):
+                  continue
               for file in files:
                   if file.endswith(".rs"):
                       path = os.path.join(root, file)
@@ -152,26 +162,28 @@ jobs:
                               c = f.read()
                           orig = c
 
-                          # 替换首选项默认语言
+                          # 暴力锁定默认语言常量
+                          c = c.replace('"en-US"', '"zh-CN"')
+                          c = c.replace('"en_US"', '"zh_CN"')
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('language: "system".into()', 'language: "zh".into()')
-                          c = c.replace('language: "en".into()', 'language: "zh".into()')
-                          c = c.replace('language: String = "en".into()', 'language: String = "zh".into()')
-                          
-                          # 替换系统 fallback 常量
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
                           c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh";')
                           c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
 
+                          # 注册中文语言到可选列表
+                          if '("en", false)' in c and '("zh", false)' not in c:
+                              c = c.replace('("en", false)', '("zh", false),\n    ("en", false)')
+
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 成功锁定首选项与默认语言为 zh: {path}")
+                              print(f"✅ 锁定中文到源码: {path}")
                       except Exception:
                           pass
 
-          # 4. 前端 index.html 注入模拟脚本
+          # 5. 前端 index.html 注入模拟脚本
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -192,15 +204,15 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                      if "<head>" in html and "photocraft_language" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
                           print(f"✅ 已在 {target_html} 注入环境重定向脚本")
           PYEOF
 
-          python3 setup_chinese.py
-          rm -f setup_chinese.py
+          python3 force_chinese.py
+          rm -f force_chinese.py
 
       # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
       - name: Build Web Application
@@ -241,7 +253,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB）
+      # 8. 深度压缩 wasm 并执行强制切片
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
