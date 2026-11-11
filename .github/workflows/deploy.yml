@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，避免 Rust 链接时爆内存闪退 (Exit code 143)
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -45,7 +45,7 @@ jobs:
         with:
           tool: trunk@0.20.3
 
-      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 支持的包装器
+      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD Wrapper
       - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
@@ -56,14 +56,15 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 下载 craft-i18n 仓库，注入 PhotoCraft 中文翻译词库并在源码中激活
+      # 6. 下载 craft-i18n 仓库，全量生成并注入中文 TSV 与 Rust 语言注册
       - name: Prepare craft-i18n Catalogs and Register Chinese
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 克隆官方 craft-i18n 词库
+          # 克隆官方多语言词库
+          rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
           cat << 'PYEOF' > setup_chinese_i18n.py
@@ -99,98 +100,63 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 检查并生成 craft-i18n 中的中文 TSV 字典 (包含图像编辑特色词汇)
-          i18n_root = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n/locales"
-          en_dir = os.path.join(i18n_root, "en")
-          zh_dir = os.path.join(i18n_root, "zh")
-          os.makedirs(zh_dir, exist_ok=True)
-
+          # 2. 全盘递归扫描 craft-i18n，生成对应的 zh 目录与 TSV 词条
+          i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
           translations = {
-              "File": "文件",
-              "Open": "打开",
-              "Open...": "打开...",
-              "Save": "保存",
-              "Save As": "另存为",
-              "Save As...": "另存为...",
-              "Export": "导出",
-              "Print": "打印",
-              "Settings": "设置",
-              "Preferences": "首选项",
-              "Language": "语言",
-              "Help": "帮助",
-              "About": "关于",
-              "Close": "关闭",
-              "Edit": "编辑",
-              "View": "视图",
-              "Tools": "工具",
-              "Image": "图像",
-              "Crop": "裁剪",
-              "Resize": "调整大小",
-              "Rotate": "旋转",
-              "Rotate Clockwise": "顺时针旋转",
-              "Rotate Counterclockwise": "逆时针旋转",
-              "Flip Horizontal": "水平翻转",
-              "Flip Vertical": "垂直翻转",
-              "Brightness": "亮度",
-              "Contrast": "对比度",
-              "Saturation": "饱和度",
-              "Filters": "滤镜",
-              "Zoom": "缩放",
-              "Fit": "适应窗口",
-              "Fit Width": "适应宽度",
-              "Actual Size": "实际大小",
-              "English": "English",
-              "Auto": "跟随系统",
-              "System": "跟随系统",
-              "Cancel": "取消",
-              "OK": "确定",
-              "Apply": "应用",
-              "Reset": "重置",
-              "Undo": "撤销",
-              "Redo": "重做"
+              "File": "文件", "Open": "打开", "Open...": "打开...", "Save": "保存",
+              "Save As": "另存为", "Save As...": "另存为...", "Export": "导出", "Print": "打印",
+              "Settings": "设置", "Preferences": "首选项", "Language": "语言", "Help": "帮助",
+              "About": "关于", "Close": "关闭", "Edit": "编辑", "View": "视图", "Tools": "工具",
+              "Image": "图像", "Crop": "裁剪", "Resize": "调整大小", "Rotate": "旋转",
+              "Rotate Clockwise": "顺时针旋转", "Rotate Counterclockwise": "逆时针旋转",
+              "Flip Horizontal": "水平翻转", "Flip Vertical": "垂直翻转", "Brightness": "亮度",
+              "Contrast": "对比度", "Saturation": "饱和度", "Filters": "滤镜", "Zoom": "缩放",
+              "Fit": "适应窗口", "Fit Width": "适应宽度", "Actual Size": "实际大小",
+              "English": "English", "Auto": "跟随系统", "System": "跟随系统",
+              "Cancel": "取消", "OK": "确定", "Apply": "应用", "Reset": "重置",
+              "Undo": "撤销", "Redo": "重做", "Layers": "图层", "History": "历史记录"
           }
 
-          # 同时处理 common.tsv, photocraft.tsv, 以及其他 tsv 模板
-          tsv_files = [f for f in os.listdir(en_dir) if f.endswith(".tsv")] if os.path.exists(en_dir) else ["common.tsv", "photocraft.tsv"]
-          for fname in tsv_files:
-              src = os.path.join(en_dir, fname)
-              dst = os.path.join(zh_dir, fname)
-              if os.path.exists(src):
-                  with open(src, "r", encoding="utf-8") as f:
-                      lines = f.readlines()
-                  out_lines = []
-                  for line in lines:
-                      parts = line.rstrip("\r\n").split("\t")
-                      if len(parts) >= 2:
-                          en_text = parts[1]
-                          trans = translations.get(en_text, en_text)
-                          out_lines.append(f"{parts[0]}\t{en_text}\t{trans}\n")
-                      else:
-                          out_lines.append(line)
-                  if "photo" in fname:
-                      out_lines.insert(0, "@id\tlanguage.name\t简体中文\n")
-                  with open(dst, "w", encoding="utf-8") as f:
-                      f.writelines(out_lines)
-                  print(f"✅ 已生成中文翻译词库: {dst}")
+          found_en = False
+          for root, dirs, files in os.walk(i18n_repo):
+              if os.path.basename(root) == "en":
+                  found_en = True
+                  zh_dir = os.path.join(os.path.dirname(root), "zh")
+                  os.makedirs(zh_dir, exist_ok=True)
+                  for f in files:
+                      if f.endswith(".tsv"):
+                          src_p = os.path.join(root, f)
+                          dst_p = os.path.join(zh_dir, f)
+                          with open(src_p, "r", encoding="utf-8") as rf:
+                              lines = rf.readlines()
+                          out = []
+                          for line in lines:
+                              p = line.rstrip("\r\n").split("\t")
+                              if len(p) >= 2:
+                                  en_t = p[1]
+                                  tr = translations.get(en_t, en_t)
+                                  out.append(f"{p[0]}\t{en_t}\t{tr}\n")
+                              else:
+                                  out.append(line)
+                          out.insert(0, "@id\tlanguage.name\t简体中文\n")
+                          with open(dst_p, "w", encoding="utf-8") as wf:
+                              wf.writelines(out)
+                          print(f"✅ 生成并汉化词库: {dst_p}")
 
-          # 3. 在 crates/ui-egui/src/i18n.rs 中注册中文语言
-          i18n_rs = "crates/ui-egui/src/i18n.rs"
-          if os.path.exists(i18n_rs):
-              with open(i18n_rs, "r", encoding="utf-8") as f:
-                  code = f.read()
-              
-              if '("en", false)' in code and '("zh", false)' not in code:
-                  code = code.replace('("en", false)', '("zh", false),\n    ("en", false)')
-                  print("✅ 成功在 LANGUAGES 中注册 ('zh', false)")
-              
-              if '"en" => "English"' in code and '"zh" =>' not in code:
-                  code = code.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "en" => "English"')
-                  print("✅ 成功在 english_name 中追加中文映射")
-              
-              with open(i18n_rs, "w", encoding="utf-8") as f:
-                  f.write(code)
+          if not found_en:
+              # 兜底：直接在 craft-i18n/locales/zh 构建基础 TSV
+              fallback_zh = os.path.join(i18n_repo, "locales", "zh")
+              os.makedirs(fallback_zh, exist_ok=True)
+              for name in ["common.tsv", "photocraft.tsv"]:
+                  fp = os.path.join(fallback_zh, name)
+                  lines = ["@id\tlanguage.name\t简体中文\n"]
+                  for k, v in translations.items():
+                      lines.append(f"ui.{k.lower().replace(' ', '_')}\t{k}\t{v}\n")
+                  with open(fp, "w", encoding="utf-8") as f:
+                      f.writelines(lines)
+                  print(f"✅ 兜底生成词库: {fp}")
 
-          # 4. 将底层默认语言设置为中文 (zh)
+          # 3. 递归扫描 crates/ 源码，注册中文选项并设定默认 zh
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -199,16 +165,31 @@ jobs:
                           with open(path, "r", encoding="utf-8") as f:
                               c = f.read()
                           orig = c
+
+                          # 注册 LANGUAGES: (&str, bool) 或 (&str, &str)
+                          if '("en", false)' in c and '("zh", false)' not in c:
+                              c = c.replace('("en", false)', '("zh", false),\n    ("en", false)')
+                          if '("en", "English")' in c and '("zh", "简体中文")' not in c and "crates/ocr" not in path:
+                              c = c.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
+
+                          # 映射名称分支
+                          if '"en" => "English"' in c and '"zh" =>' not in c:
+                              c = c.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "en" => "English"')
+
+                          # 默认语言设定
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
+                          c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
+
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 成功修改底层默认语言: {path}")
+                              print(f"✅ 已注入中文支持到源码: {path}")
                       except Exception:
                           pass
 
-          # 5. 前端 index.html 注入模拟脚本
+          # 4. 前端 index.html 注入环境重定向与本地缓存初始化
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -221,7 +202,7 @@ jobs:
                           "try {\n"
                           "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
                           "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
-                          "  ['photocraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) {\n"
+                          "  ['photocraft_language', 'language', 'locale', 'app_lang', 'selected_language'].forEach(function(k) {\n"
                           "    localStorage.setItem(k, 'zh');\n"
                           "  });\n"
                           "} catch(e) {}\n"
@@ -231,7 +212,7 @@ jobs:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
-                          print(f"✅ 已在 {target_html} 注入浏览器中文重定向脚本")
+                          print(f"✅ 已在 {target_html} 注入浏览器重定向脚本")
           PYEOF
 
           python3 setup_chinese_i18n.py
@@ -244,8 +225,6 @@ jobs:
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-          
-          # 自动寻找 app 下的入口 html
           TARGET_HTML=$(find apps -name "index.html" | head -n 1)
           if [ -z "$TARGET_HTML" ]; then
             TARGET_HTML="index.html"
@@ -254,7 +233,6 @@ jobs:
 
           trunk build "$TARGET_HTML" --release
           
-          # 归拢编译产物至根目录 dist/web/
           python3 - << 'EOF'
           import os, shutil, glob
 
@@ -277,7 +255,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 限制）
+      # 8. 深度压缩 wasm 并执行强制切片
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
