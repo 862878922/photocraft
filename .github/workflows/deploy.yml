@@ -1,0 +1,401 @@
+name: Deploy PhotoCraft to Cloudflare Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. 扩容 10GB 虚拟内存，避免 Rust 链接时爆内存闪退 (Exit code 143)
+      - name: Expand Swap Space (Fix OOM Exit Code 143)
+        run: |
+          echo "=== 扩容前内存状况 ==="
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== 扩容后内存状况 ==="
+          free -h
+
+      # 2. 安装 Rust 工具链与 Wasm 目标平台
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # 3. Rust 依赖与编译缓存加速
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 4. 安装兼容版 Trunk
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.20.3
+
+      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 支持的包装器
+      - name: Install Modern Binaryen & Setup SIMD Wrapper
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          
+          sudo mv /usr/local/bin/wasm-opt /usr/local/bin/wasm-opt-raw
+          printf '#!/bin/bash\nexec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"\n' | sudo tee /usr/local/bin/wasm-opt > /dev/null
+          sudo chmod +x /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      # 6. 下载 craft-i18n 仓库，注入 PhotoCraft 中文翻译词库并在源码中激活
+      - name: Prepare craft-i18n Catalogs and Register Chinese
+        run: |
+          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
+          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
+          find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
+
+          # 克隆官方 craft-i18n 词库
+          git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
+
+          cat << 'PYEOF' > setup_chinese_i18n.py
+          import os, re, shutil
+
+          # 1. 配置 Cargo.toml 最小体积 Profile
+          cargo_file = "Cargo.toml"
+          if os.path.exists(cargo_file):
+              with open(cargo_file, "r", encoding="utf-8") as f:
+                  lines = f.readlines()
+              filtered = []
+              skip = False
+              for line in lines:
+                  if line.strip().startswith("[profile.release"):
+                      skip = True
+                      continue
+                  if skip and line.strip().startswith("["):
+                      skip = False
+                  if not skip:
+                      filtered.append(line)
+
+              opt_profile = (
+                  "\n[profile.release]\n"
+                  'opt-level = "z"\n'
+                  'lto = "fat"\n'
+                  "codegen-units = 1\n"
+                  'panic = "abort"\n'
+                  "strip = true\n"
+                  "debug = 0\n"
+              )
+              filtered.append(opt_profile)
+              with open(cargo_file, "w", encoding="utf-8") as f:
+                  f.writelines(filtered)
+              print("✅ Cargo.toml Fat LTO 配置完成")
+
+          # 2. 检查并生成 craft-i18n 中的中文 TSV 字典 (包含图像编辑特色词汇)
+          i18n_root = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n/locales"
+          en_dir = os.path.join(i18n_root, "en")
+          zh_dir = os.path.join(i18n_root, "zh")
+          os.makedirs(zh_dir, exist_ok=True)
+
+          translations = {
+              "File": "文件",
+              "Open": "打开",
+              "Open...": "打开...",
+              "Save": "保存",
+              "Save As": "另存为",
+              "Save As...": "另存为...",
+              "Export": "导出",
+              "Print": "打印",
+              "Settings": "设置",
+              "Preferences": "首选项",
+              "Language": "语言",
+              "Help": "帮助",
+              "About": "关于",
+              "Close": "关闭",
+              "Edit": "编辑",
+              "View": "视图",
+              "Tools": "工具",
+              "Image": "图像",
+              "Crop": "裁剪",
+              "Resize": "调整大小",
+              "Rotate": "旋转",
+              "Rotate Clockwise": "顺时针旋转",
+              "Rotate Counterclockwise": "逆时针旋转",
+              "Flip Horizontal": "水平翻转",
+              "Flip Vertical": "垂直翻转",
+              "Brightness": "亮度",
+              "Contrast": "对比度",
+              "Saturation": "饱和度",
+              "Filters": "滤镜",
+              "Zoom": "缩放",
+              "Fit": "适应窗口",
+              "Fit Width": "适应宽度",
+              "Actual Size": "实际大小",
+              "English": "English",
+              "Auto": "跟随系统",
+              "System": "跟随系统",
+              "Cancel": "取消",
+              "OK": "确定",
+              "Apply": "应用",
+              "Reset": "重置",
+              "Undo": "撤销",
+              "Redo": "重做"
+          }
+
+          # 同时处理 common.tsv, photocraft.tsv, 以及其他 tsv 模板
+          tsv_files = [f for f in os.listdir(en_dir) if f.endswith(".tsv")] if os.path.exists(en_dir) else ["common.tsv", "photocraft.tsv"]
+          for fname in tsv_files:
+              src = os.path.join(en_dir, fname)
+              dst = os.path.join(zh_dir, fname)
+              if os.path.exists(src):
+                  with open(src, "r", encoding="utf-8") as f:
+                      lines = f.readlines()
+                  out_lines = []
+                  for line in lines:
+                      parts = line.rstrip("\r\n").split("\t")
+                      if len(parts) >= 2:
+                          en_text = parts[1]
+                          trans = translations.get(en_text, en_text)
+                          out_lines.append(f"{parts[0]}\t{en_text}\t{trans}\n")
+                      else:
+                          out_lines.append(line)
+                  if "photo" in fname:
+                      out_lines.insert(0, "@id\tlanguage.name\t简体中文\n")
+                  with open(dst, "w", encoding="utf-8") as f:
+                      f.writelines(out_lines)
+                  print(f"✅ 已生成中文翻译词库: {dst}")
+
+          # 3. 在 crates/ui-egui/src/i18n.rs 中注册中文语言
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          if os.path.exists(i18n_rs):
+              with open(i18n_rs, "r", encoding="utf-8") as f:
+                  code = f.read()
+              
+              if '("en", false)' in code and '("zh", false)' not in code:
+                  code = code.replace('("en", false)', '("zh", false),\n    ("en", false)')
+                  print("✅ 成功在 LANGUAGES 中注册 ('zh', false)")
+              
+              if '"en" => "English"' in code and '"zh" =>' not in code:
+                  code = code.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "en" => "English"')
+                  print("✅ 成功在 english_name 中追加中文映射")
+              
+              with open(i18n_rs, "w", encoding="utf-8") as f:
+                  f.write(code)
+
+          # 4. 将底层默认语言设置为中文 (zh)
+          for root, _, files in os.walk("crates"):
+              for file in files:
+                  if file.endswith(".rs"):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, "r", encoding="utf-8") as f:
+                              c = f.read()
+                          orig = c
+                          c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          if c != orig:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(c)
+                              print(f"✅ 成功修改底层默认语言: {path}")
+                      except Exception:
+                          pass
+
+          # 5. 前端 index.html 注入模拟脚本
+          for root, _, files in os.walk("apps"):
+              for file in files:
+                  if file == "index.html":
+                      target_html = os.path.join(root, file)
+                      with open(target_html, "r", encoding="utf-8") as f:
+                          html = f.read()
+
+                      hook_script = (
+                          "<script>\n"
+                          "try {\n"
+                          "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                          "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                          "  ['photocraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) {\n"
+                          "    localStorage.setItem(k, 'zh');\n"
+                          "  });\n"
+                          "} catch(e) {}\n"
+                          "</script>\n"
+                      )
+                      if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                          html = html.replace("<head>", "<head>\n" + hook_script)
+                          with open(target_html, "w", encoding="utf-8") as f:
+                              f.write(html)
+                          print(f"✅ 已在 {target_html} 注入浏览器中文重定向脚本")
+          PYEOF
+
+          python3 setup_chinese_i18n.py
+          rm -f setup_chinese_i18n.py
+
+      # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
+      - name: Build Web Application
+        env:
+          CARGO_BUILD_JOBS: 2
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
+        run: |
+          mkdir -p dist/web
+          
+          # 自动寻找 app 下的入口 html
+          TARGET_HTML=$(find apps -name "index.html" | head -n 1)
+          if [ -z "$TARGET_HTML" ]; then
+            TARGET_HTML="index.html"
+          fi
+          echo "使用构建入口: $TARGET_HTML"
+
+          trunk build "$TARGET_HTML" --release
+          
+          # 归拢编译产物至根目录 dist/web/
+          python3 - << 'EOF'
+          import os, shutil, glob
+
+          all_wasm = [p for p in glob.glob("**/*.wasm", recursive=True) if "target" not in p and "dist/web" not in p]
+          print("发现编译产物路径:", all_wasm)
+          
+          if all_wasm:
+              source_dir = os.path.dirname(all_wasm[0])
+              print(f"定位到实际产物目录: {source_dir}，正在归拢到 dist/web/ ...")
+              for item in os.listdir(source_dir):
+                  src = os.path.join(source_dir, item)
+                  dst = os.path.join("dist/web", item)
+                  if os.path.isdir(src):
+                      shutil.copytree(src, dst, dirs_exist_ok=True)
+                  else:
+                      shutil.copy2(src, dst)
+              print("✅ 产物已成功归拢到 dist/web/")
+          EOF
+
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/web/
+
+      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 限制）
+      - name: Compress Wasm & Handle 25MB Cloudflare Limit
+        run: |
+          echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
+          cat << 'PYEOF' > split_wasm.py
+          import os, glob, subprocess, json
+
+          wasm_files = glob.glob("dist/web/**/*.wasm", recursive=True)
+          if not wasm_files:
+              wasm_files = glob.glob("dist/**/*.wasm", recursive=True)
+          
+          if not wasm_files:
+              print("❌ dist 目录下未找到任何 wasm 文件")
+              exit(1)
+
+          for wasm_path in wasm_files:
+              wasm_dir = os.path.dirname(wasm_path)
+              wasm_filename = os.path.basename(wasm_path)
+              print(f"\n--- 处理文件: {wasm_filename} ---")
+              
+              cmd = [
+                  "/usr/local/bin/wasm-opt-raw",
+                  "--all-features",
+                  "--enable-simd",
+                  "-Oz",
+                  "--strip-debug",
+                  "--strip-producers",
+                  wasm_path,
+                  "-o",
+                  wasm_path
+              ]
+              try:
+                  subprocess.run(cmd, check=True)
+                  print(f"优化完成，当前大小: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
+              except Exception as e:
+                  print(f"wasm-opt 优化过程跳过: {e}")
+
+              size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+              if size_mb > 20.0:
+                  print(f"⚠️ 文件体积为 {size_mb:.2f} MB，超过 20MB 安全线，启动自动切片机制...")
+                  chunk_size = 10 * 1024 * 1024
+                  with open(wasm_path, "rb") as f:
+                      data = f.read()
+
+                  chunks = []
+                  for i in range(0, len(data), chunk_size):
+                      part_name = f"{wasm_filename}.part{len(chunks)}"
+                      part_path = os.path.join(wasm_dir, part_name)
+                      with open(part_path, "wb") as pf:
+                          pf.write(data[i:i+chunk_size])
+                      chunks.append(part_name)
+                      print(f"  已生成小切片: {part_name} ({len(data[i:i+chunk_size])/(1024*1024):.2f} MB)")
+
+                  os.remove(wasm_path)
+                  print(f"✅ 已删除原始超标大文件: {wasm_filename}")
+
+                  html_path = os.path.join(wasm_dir, "index.html")
+                  if os.path.exists(html_path):
+                      with open(html_path, "r", encoding="utf-8") as f:
+                          html = f.read()
+
+                      parts_json_str = json.dumps(chunks)
+                      
+                      js_lines = [
+                          "<script>",
+                          "(function() {",
+                          "  var origFetch = window.fetch;",
+                          '  var targetWasm = "' + wasm_filename + '";',
+                          "  var parts = " + parts_json_str + ";",
+                          "  window.fetch = async function() {",
+                          "    var args = Array.prototype.slice.call(arguments);",
+                          "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');",
+                          "    if (url.indexOf(targetWasm) !== -1) {",
+                          "      console.log('[ChunkLoader] 正在并发获取小分片并透明组装...');",
+                          "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);",
+                          "      var buffers = await Promise.all(parts.map(function(p) {",
+                          "        return origFetch(basePath + p).then(function(r) {",
+                          "          if (!r.ok) throw new Error('分片下载失败: ' + p);",
+                          "          return r.arrayBuffer();",
+                          "        });",
+                          "      }));",
+                          "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);",
+                          "      var merged = new Uint8Array(total);",
+                          "      var offset = 0;",
+                          "      for (var i = 0; i < buffers.length; i++) {",
+                          "        merged.set(new Uint8Array(buffers[i]), offset);",
+                          "        offset += buffers[i].byteLength;",
+                          "      }",
+                          "      return new Response(merged, { headers: { 'Content-Type': 'application/wasm' } });",
+                          "    }",
+                          "    return origFetch.apply(this, args);",
+                          "  };",
+                          "})();",
+                          "</script>"
+                      ]
+                      transparent_loader = "\n".join(js_lines)
+
+                      if "<head>" in html:
+                          html = html.replace("<head>", "<head>\n" + transparent_loader)
+                      else:
+                          html = transparent_loader + "\n" + html
+
+                      with open(html_path, "w", encoding="utf-8") as f:
+                          f.write(html)
+                      print(f"✅ 已在 {html_path} 中注入透明组装脚本")
+              else:
+                  print(f"✅ 文件体积安全: {size_mb:.2f} MB (<= 20MB)，无需切片")
+          PYEOF
+
+          python3 split_wasm.py
+          rm -f split_wasm.py
+
+          echo "=== 最终提交部署的文件列表（确认无任何文件大于 20MB） ==="
+          ls -lh dist/web/
+
+      # 9. 部署发布到 Cloudflare Pages (lotelf-photo)
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist/web --project-name=lotelf-photo --branch=main --commit-dirty=true
