@@ -56,28 +56,21 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 本地克隆 craft-libs 并通过 Cargo [patch] 机制深度接管 i18n
-      - name: Patch Dependencies and Register Chinese Language
+      # 6. 配置 craft-i18n 词库并在源码层面彻底锁定中文默认值
+      - name: Prepare craft-i18n and Lock Chinese Default in Source
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 1. 克隆官方多语言词库
+          # 克隆官方多语言词库
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
-          # 2. 克隆对应 commit 的 craft-libs 到本地准备 patch
-          rm -rf local_craft_libs
-          git clone https://github.com/storytold/craft-libs.git local_craft_libs
-          cd local_craft_libs
-          git checkout 1b34eba41e62138fc2438d2734523b302840b45d || git checkout 787a7a0f972fd1d7a7618fdbeca3a5267a0407ff || true
-          cd ..
-
-          cat << 'PYEOF' > setup_chinese_patch.py
+          cat << 'PYEOF' > setup_chinese.py
           import os, re, shutil
 
-          # 1. 配置 Cargo.toml 最小体积 Profile 并加入 patch 机制
+          # 1. 深度配置 Cargo.toml 最小体积 Profile（不添加错误的 patch）
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -103,19 +96,11 @@ jobs:
                   "debug = 0\n"
               )
               filtered.append(opt_profile)
-
-              # 核心：使用 Cargo patch 强制重定向远程 craft-libs 依赖
-              patch_block = (
-                  "\n[patch.\"https://github.com/storytold/craft-libs.git\"]\n"
-                  'craft-i18n = { path = "local_craft_libs/crates/i18n" }\n'
-              )
-              filtered.append(patch_block)
-
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("✅ Cargo.toml 已更新并挂载 local_craft_libs/crates/i18n")
+              print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 深入 craft-i18n 生成真实的 zh 词条目录
+          # 2. 为 craft-i18n 中所有包含 en 的路径生成 zh 目录与翻译条目
           i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
           translations = {
               "File": "文件", "Open": "打开", "Open...": "打开...", "Save": "保存",
@@ -157,36 +142,7 @@ jobs:
                           wf.writelines(out)
                       print(f"✅ 生成 zh 词条文件: {dst_f}")
 
-          # 3. 深入 local_craft_libs/crates/i18n 源码修改语言列表和默认语言
-          i18n_crate_dir = "local_craft_libs/crates/i18n"
-          if os.path.exists(i18n_crate_dir):
-              for root, _, files in os.walk(i18n_crate_dir):
-                  for file in files:
-                      if file.endswith(".rs"):
-                          fp = os.path.join(root, file)
-                          with open(fp, "r", encoding="utf-8") as rf:
-                              code = rf.read()
-                          orig = code
-                          
-                          # 语言列表增加 zh / 简体中文
-                          if '("en", "English")' in code and '("zh", "简体中文")' not in code:
-                              code = code.replace('("en", "English")', '("zh", "简体中文"), ("en", "English")')
-                          if '("en", false)' in code and '("zh", false)' not in code:
-                              code = code.replace('("en", false)', '("zh", false), ("en", false)')
-                          if '["en"]' in code and '["zh", "en"]' not in code:
-                              code = code.replace('["en"]', '["zh", "en"]')
-                          
-                          # 默认语言硬编码为 zh
-                          code = code.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
-                          code = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', code)
-                          code = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', code)
-                          
-                          if code != orig:
-                              with open(fp, "w", encoding="utf-8") as wf:
-                                  wf.write(code)
-                              print(f"✅ 已成功修改 local_craft_libs/i18n: {fp}")
-
-          # 4. 递归扫描本地 crates/ 源码，将首选项默认值锁定为 zh
+          # 3. 递归扫描 crates/ 源码，将首选项默认值与系统回退强制锁定为 zh
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -196,21 +152,26 @@ jobs:
                               c = f.read()
                           orig = c
 
+                          # 替换首选项默认语言
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('language: "system".into()', 'language: "zh".into()')
+                          c = c.replace('language: "en".into()', 'language: "zh".into()')
+                          c = c.replace('language: String = "en".into()', 'language: String = "zh".into()')
+                          
+                          # 替换系统 fallback 常量
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh";')
                           c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
 
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 成功锁定本地首选项默认语言: {path}")
+                              print(f"✅ 成功锁定首选项与默认语言为 zh: {path}")
                       except Exception:
                           pass
 
-          # 5. 前端 index.html 注入模拟脚本
+          # 4. 前端 index.html 注入模拟脚本
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -231,17 +192,17 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "photocraft_language" not in html:
+                      if "<head>" in html and "Object.defineProperty(navigator" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
                           print(f"✅ 已在 {target_html} 注入环境重定向脚本")
           PYEOF
 
-          python3 setup_chinese_patch.py
-          rm -f setup_chinese_patch.py
+          python3 setup_chinese.py
+          rm -f setup_chinese.py
 
-      # 7. 传入 CRAFT_I18N_DIR 及默认语言环境变量并执行 Web 构建
+      # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
@@ -280,7 +241,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 限制）
+      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
