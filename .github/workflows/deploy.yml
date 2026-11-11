@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -56,8 +56,8 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 下载 craft-i18n 仓库，深度汉化所有 TSV 词库并在源码与入口中锁定默认中文
-      - name: Prepare craft-i18n Catalogs and Enforce Chinese Everywhere
+      # 6. 下载 craft-i18n 仓库，直接将 en 词库全部原地替换为中文并清理旧持久化
+      - name: Force Hardcoded Chinese Catalogs and Purge Web Cache
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
@@ -67,10 +67,10 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
-          cat << 'PYEOF' > force_chinese.py
+          cat << 'PYEOF' > force_chinese_final.py
           import os, re, shutil
 
-          # 1. 深度配置 Cargo.toml 最小体积 Profile
+          # 1. 配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -114,10 +114,11 @@ jobs:
               "English": "简体中文", "Auto": "跟随系统", "System": "跟随系统",
               "Cancel": "取消", "OK": "确定", "Apply": "应用", "Reset": "重置",
               "Undo": "撤销", "Redo": "重做", "Layers": "图层", "History": "历史记录",
-              "New": "新建", "New...": "新建...", "Export...": "导出...", "Import": "导入"
+              "New": "新建", "New...": "新建...", "Export...": "导出...", "Import": "导入",
+              "Select": "选择", "Color": "颜色", "Brush": "画笔", "Eraser": "橡皮擦"
           }
 
-          # 3. 递归汉化 craft-i18n 下面的所有 TSV 文件（包括 en 和新增的 zh）
+          # 3. 将 craft-i18n 仓库中所有的 TSV 文件直接覆盖为中文
           i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
           for root, dirs, files in os.walk(i18n_repo):
               for f in files:
@@ -131,29 +132,23 @@ jobs:
                           if len(p) >= 2:
                               en_t = p[1]
                               tr = translations.get(en_t, en_t)
-                              # 无论原本第二列是什么，把第三列和第四列全部替换为汉字
-                              if len(p) == 2:
-                                  out.append(f"{p[0]}\t{en_t}\t{tr}\n")
-                              else:
-                                  out.append(f"{p[0]}\t{en_t}\t{tr}\n")
+                              # 直接把英文字段本身全部覆写为中文字符串
+                              out.append(f"{p[0]}\t{tr}\t{tr}\n")
                           else:
                               out.append(line)
                       with open(fp, "w", encoding="utf-8") as wf:
                           wf.writelines(out)
-                      print(f"✅ 汉化词条文件: {fp}")
 
-          # 同时将所有包含 tsv 的 en 文件夹直接完整克隆一份为 zh
+          # 同时将所有包含 tsv 的 en 目录复制生成 zh 目录
           for root, dirs, files in os.walk(i18n_repo):
               if os.path.basename(root) == "en":
                   zh_dir = os.path.join(os.path.dirname(root), "zh")
                   if not os.path.exists(zh_dir):
                       shutil.copytree(root, zh_dir)
-                      print(f"✅ 复制生成 zh 目录: {zh_dir}")
+                      print(f"✅ 生成 zh 目录: {zh_dir}")
 
-          # 4. 递归穿透修改仓库里所有 .rs 源码文件，硬编码锁定中文
-          for root, _, files in os.walk("."):
-              if any(k in root for k in ["target", ".git", "dist", "craft-i18n"]):
-                  continue
+          # 4. 穿透扫描所有 crates/ 源码，将首选项与默认语言强制替换为 zh
+          for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
                       path = os.path.join(root, file)
@@ -162,28 +157,25 @@ jobs:
                               c = f.read()
                           orig = c
 
-                          # 暴力锁定默认语言常量
                           c = c.replace('"en-US"', '"zh-CN"')
                           c = c.replace('"en_US"', '"zh_CN"')
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('language: "system".into()', 'language: "zh".into()')
+                          c = c.replace('language: "en".into()', 'language: "zh".into()')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
                           c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh";')
                           c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-
-                          # 注册中文语言到可选列表
-                          if '("en", false)' in c and '("zh", false)' not in c:
-                              c = c.replace('("en", false)', '("zh", false),\n    ("en", false)')
+                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
 
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 锁定中文到源码: {path}")
+                              print(f"✅ 成功锁定中文到源码: {path}")
                       except Exception:
                           pass
 
-          # 5. 前端 index.html 注入模拟脚本
+          # 5. 前端 index.html 注入：彻底清理旧状态并设置强制中文
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -191,12 +183,17 @@ jobs:
                       with open(target_html, "r", encoding="utf-8") as f:
                           html = f.read()
 
+                      # 核心脚本：如果本地有旧英文存储，清除后重新将所有语言标志位锁定为 zh
                       hook_script = (
                           "<script>\n"
                           "(function() {\n"
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                          "    // 如果存在旧英文存储，清除所有旧 state 避免恢复英文\n"
+                          "    if (localStorage.getItem('photocraft_language') !== 'zh') {\n"
+                          "      localStorage.clear();\n"
+                          "    }\n"
                           "    ['photocraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
                           "      localStorage.setItem(k, 'zh');\n"
                           "    });\n"
@@ -204,15 +201,15 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "photocraft_language" not in html:
+                      if "<head>" in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
-                          print(f"✅ 已在 {target_html} 注入环境重定向脚本")
+                          print(f"✅ 已在 {target_html} 注入重定向并重置缓存")
           PYEOF
 
-          python3 force_chinese.py
-          rm -f force_chinese.py
+          python3 force_chinese_final.py
+          rm -f force_chinese_final.py
 
       # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
       - name: Build Web Application
@@ -253,7 +250,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片
+      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
