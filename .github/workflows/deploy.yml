@@ -56,14 +56,14 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 下载 craft-i18n 仓库，直接将 en 词库全部原地替换为中文并清理旧持久化
-      - name: Force Hardcoded Chinese Catalogs and Purge Web Cache
+      # 6. 下载 craft-i18n 仓库，多重别名注入并穿透锁定 Rust 底层语言逻辑
+      - name: Force Chinese Locale Injection
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 克隆官方多语言词库
+          # 1. 克隆官方多语言词库
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
@@ -118,8 +118,10 @@ jobs:
               "Select": "选择", "Color": "颜色", "Brush": "画笔", "Eraser": "橡皮擦"
           }
 
-          # 3. 将 craft-i18n 仓库中所有的 TSV 文件直接覆盖为中文
+          # 3. 深入 craft-i18n 覆盖所有 tsv 文件，并构建 zh, zh-CN, zh-Hans 三重别名
           i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
+          
+          # 首先把所有现存 TSV 内容汉化
           for root, dirs, files in os.walk(i18n_repo):
               for f in files:
                   if f.endswith(".tsv"):
@@ -132,22 +134,23 @@ jobs:
                           if len(p) >= 2:
                               en_t = p[1]
                               tr = translations.get(en_t, en_t)
-                              # 直接把英文字段本身全部覆写为中文字符串
                               out.append(f"{p[0]}\t{tr}\t{tr}\n")
                           else:
                               out.append(line)
                       with open(fp, "w", encoding="utf-8") as wf:
                           wf.writelines(out)
 
-          # 同时将所有包含 tsv 的 en 目录复制生成 zh 目录
+          # 针对所有包含 en 的目录，克隆成 zh, zh-CN, zh-Hans
           for root, dirs, files in os.walk(i18n_repo):
               if os.path.basename(root) == "en":
-                  zh_dir = os.path.join(os.path.dirname(root), "zh")
-                  if not os.path.exists(zh_dir):
-                      shutil.copytree(root, zh_dir)
-                      print(f"✅ 生成 zh 目录: {zh_dir}")
+                  parent = os.path.dirname(root)
+                  for target_alias in ["zh", "zh-CN", "zh-Hans"]:
+                      target_dir = os.path.join(parent, target_alias)
+                      if not os.path.exists(target_dir):
+                          shutil.copytree(root, target_dir)
+                          print(f"✅ 生成语言别名目录: {target_dir}")
 
-          # 4. 穿透扫描所有 crates/ 源码，将首选项与默认语言强制替换为 zh
+          # 4. 穿透搜索并替换所有 Rust 源码中的系统语言探测和首选项设置
           for root, _, files in os.walk("crates"):
               for file in files:
                   if file.endswith(".rs"):
@@ -157,25 +160,38 @@ jobs:
                               c = f.read()
                           orig = c
 
+                          # 强制将所有语言判定函数的返回结果替换为 "zh"
+                          # 匹配常用的语言系统调用
+                          c = re.sub(r'fn\s+current_locale\([^)]*\)\s*->[^{]*\{[^}]*\}', 'fn current_locale() -> String { "zh".to_string() }', c)
+                          c = re.sub(r'fn\s+system_language\([^)]*\)\s*->[^{]*\{[^}]*\}', 'fn system_language() -> String { "zh".to_string() }', c)
+                          c = re.sub(r'fn\s+detect_language\([^)]*\)\s*->[^{]*\{[^}]*\}', 'fn detect_language() -> Option<String> { Some("zh".to_string()) }', c)
+                          
+                          # 替换系统 fallback 常量与默认值
                           c = c.replace('"en-US"', '"zh-CN"')
                           c = c.replace('"en_US"', '"zh_CN"')
                           c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
                           c = c.replace('language: "system".into()', 'language: "zh".into()')
                           c = c.replace('language: "en".into()', 'language: "zh".into()')
+                          c = c.replace('language = "en"', 'language = "zh"')
+                          c = c.replace('language = "system"', 'language = "zh"')
                           c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
                           c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh";')
                           c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
                           c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
 
+                          # 扩展 LANGUAGES 支持列表
+                          if '("en", false)' in c and '("zh", false)' not in c:
+                              c = c.replace('("en", false)', '("zh", false),\n    ("en", false)')
+
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 成功锁定中文到源码: {path}")
+                              print(f"✅ 成功穿透修改 Rust 源码: {path}")
                       except Exception:
                           pass
 
-          # 5. 前端 index.html 注入：彻底清理旧状态并设置强制中文
+          # 5. 前端 index.html 注入：重置 localStorage 状态，强行固定为 zh
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -183,17 +199,15 @@ jobs:
                       with open(target_html, "r", encoding="utf-8") as f:
                           html = f.read()
 
-                      # 核心脚本：如果本地有旧英文存储，清除后重新将所有语言标志位锁定为 zh
                       hook_script = (
                           "<script>\n"
                           "(function() {\n"
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
-                          "    // 如果存在旧英文存储，清除所有旧 state 避免恢复英文\n"
-                          "    if (localStorage.getItem('photocraft_language') !== 'zh') {\n"
-                          "      localStorage.clear();\n"
-                          "    }\n"
+                          "    // 彻底清除所有历史持久化缓存，防止读取先前的英文状态\n"
+                          "    localStorage.clear();\n"
+                          "    sessionStorage.clear();\n"
                           "    ['photocraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
                           "      localStorage.setItem(k, 'zh');\n"
                           "    });\n"
