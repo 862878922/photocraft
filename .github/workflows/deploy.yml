@@ -56,21 +56,21 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 彻底汉化：粗暴重写所有 TSV，锁定源码中文，前端强删 IndexedDB
-      - name: Force Overwrite All TSV and Purge IndexedDB
+      # 6. 保留官方 zh-hans 中文词库，并在 i18n 核心模块与首选项中强制锁定 zh-hans
+      - name: Configure Official zh-hans Locale and Patch i18n Core
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 1. 克隆官方多语言词库
+          # 克隆官方多语言词库（保留原始完整的 locales/zh-hans/*.tsv，绝不破坏词条键名）
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
-          cat << 'PYEOF' > force_chinese_nuclear.py
+          cat << 'PYEOF' > patch_zh_hans.py
           import os, re, shutil
 
-          # 1. 深度配置 Cargo.toml 最小体积 Profile
+          # 1. 配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -100,81 +100,63 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 超全汉化字典
-          translations = {
-              "File": "文件", "Open": "打开", "Open...": "打开...", "Save": "保存",
-              "Save As": "另存为", "Save As...": "另存为...", "Export": "导出", "Print": "打印",
-              "Settings": "设置", "Preferences": "首选项", "Language": "语言", "Help": "帮助",
-              "About": "关于", "Close": "关闭", "Edit": "编辑", "View": "视图", "Tools": "工具",
-              "Image": "图像", "Crop": "裁剪", "Resize": "调整大小", "Rotate": "旋转",
-              "Rotate Clockwise": "顺时针旋转", "Rotate Counterclockwise": "逆时针旋转",
-              "Flip Horizontal": "水平翻转", "Flip Vertical": "垂直翻转", "Brightness": "亮度",
-              "Contrast": "对比度", "Saturation": "饱和度", "Filters": "滤镜", "Zoom": "缩放",
-              "Fit": "适应窗口", "Fit Width": "适应宽度", "Actual Size": "实际大小",
-              "English": "简体中文", "Auto": "跟随系统", "System": "跟随系统",
-              "Cancel": "取消", "OK": "确定", "Apply": "应用", "Reset": "重置",
-              "Undo": "撤销", "Redo": "重做", "Layers": "图层", "History": "历史记录",
-              "New": "新建", "New...": "新建...", "Export...": "导出...", "Import": "导入",
-              "Select": "选择", "Color": "颜色", "Brush": "画笔", "Eraser": "橡皮擦"
-          }
-
-          # 3. 暴力覆盖 craft-i18n 中的每一个 TSV 文件（把英文列直接换成中文）
+          # 2. 检查官方 zh-hans 词库并复制别名目录以防代码使用 zh / zh-cn
           i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
-          tsv_count = 0
-          for root, dirs, files in os.walk(i18n_repo):
-              for f in files:
-                  if f.endswith(".tsv"):
-                      fp = os.path.join(root, f)
-                      try:
-                          with open(fp, "r", encoding="utf-8", errors="ignore") as rf:
-                              lines = rf.readlines()
-                          out = []
-                          for line in lines:
-                              parts = line.rstrip("\r\n").split("\t")
-                              if len(parts) >= 2:
-                                  en_text = parts[1]
-                                  tr = translations.get(en_text, en_text)
-                                  out.append(f"{parts[0]}\t{tr}\t{tr}\n")
-                              else:
-                                  out.append(line)
-                          with open(fp, "w", encoding="utf-8") as wf:
-                              wf.writelines(out)
-                          tsv_count += 1
-                      except Exception:
-                          pass
-          print(f"✅ 已全盘覆写 craft-i18n 中的 {tsv_count} 个 TSV 文件为中文")
+          zh_hans_dir = os.path.join(i18n_repo, "locales", "zh-hans")
+          if os.path.exists(zh_hans_dir):
+              print("✅ 发现官方简体中文词库:", os.listdir(zh_hans_dir))
+              for alias in ["zh", "zh-cn", "zh-CN"]:
+                  alias_dir = os.path.join(i18n_repo, "locales", alias)
+                  if not os.path.exists(alias_dir):
+                      shutil.copytree(zh_hans_dir, alias_dir)
+          else:
+              print("⚠️ 未找到 locales/zh-hans，列出 locales 目录:", os.listdir(os.path.join(i18n_repo, "locales")))
 
-          # 4. 穿透修改所有 crates 源码中系统语言探测和硬编码英文
-          for root, _, files in os.walk("crates"):
+          # 3. 打印并深度修改 crates/ui-egui/src/i18n 下的核心文件
+          i18n_dir = "crates/ui-egui/src/i18n"
+          if os.path.exists(i18n_dir):
+              for fn in sorted(os.listdir(i18n_dir)):
+                  if fn.endswith(".rs") and "test" not in fn:
+                      fp = os.path.join(i18n_dir, fn)
+                      with open(fp, "r", encoding="utf-8") as f:
+                          src = f.read()
+                      print(f"\n--- 原始 {fp} 关键片段 ---")
+                      for idx, ln in enumerate(src.splitlines()[:80], 1):
+                          print(f"{idx}: {ln}")
+
+                      new_src = src
+                      # 将所有系统探测/默认语言/回退 "en" 全部改为 "zh-hans"
+                      new_src = new_src.replace('"en-US"', '"zh-Hans"')
+                      new_src = new_src.replace('"en"', '"zh-hans"')
+                      new_src = new_src.replace('"system"', '"zh-hans"')
+                      if new_src != src:
+                          with open(fp, "w", encoding="utf-8") as f:
+                              f.write(new_src)
+                          print(f"✅ 已将 {fp} 中的语言标识全面重定向至 zh-hans")
+
+          # 4. 扫描 crates/ui-egui 下所有非测试源码，锁定默认语言配置为 zh-hans
+          for root, _, files in os.walk("crates/ui-egui/src"):
               for file in files:
-                  if file.endswith(".rs"):
+                  if file.endswith(".rs") and "test" not in file and "test" not in root:
                       path = os.path.join(root, file)
-                      try:
-                          with open(path, "r", encoding="utf-8") as f:
-                              c = f.read()
-                          orig = c
+                      with open(path, "r", encoding="utf-8") as f:
+                          c = f.read()
+                      orig = c
 
-                          c = c.replace('"en-US"', '"zh-CN"')
-                          c = c.replace('"en_US"', '"zh_CN"')
-                          c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
-                          c = c.replace('language: "system".into()', 'language: "zh".into()')
-                          c = c.replace('language: "en".into()', 'language: "zh".into()')
-                          c = c.replace('language = "en"', 'language = "zh"')
-                          c = c.replace('language = "system"', 'language = "zh"')
-                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
-                          c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh";')
-                          c = re.sub(r'const\s+DEFAULT_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const DEFAULT_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'const\s+FALLBACK_LANG(?:UAGE)?:\s*&str\s*=\s*"en";', 'const FALLBACK_LANGUAGE: &str = "zh";', c)
-                          c = re.sub(r'language:\s*String\s*=\s*"en"[^;]*;', 'language: String = "zh".into();', c)
+                      # 匹配各类语言默认字段
+                      c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
+                      c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
+                      c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
+                      c = re.sub(r'(locale\s*:\s*Option<String>\s*=\s*)None', r'\1Some("zh-hans".into())', c)
+                      c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh-hans";')
+                      c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh-hans";')
 
-                          if c != orig:
-                              with open(path, "w", encoding="utf-8") as f:
-                                  f.write(c)
-                              print(f"✅ 成功穿透修改 Rust 源码: {path}")
-                      except Exception:
-                          pass
+                      if c != orig:
+                          with open(path, "w", encoding="utf-8") as f:
+                              f.write(c)
+                          print(f"✅ 已修改首选项默认语言为 zh-hans: {path}")
 
-          # 5. 前端 index.html 注入终极缓存核弹：删除 IndexedDB、清空 localStorage、伪装 navigator
+          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -182,47 +164,44 @@ jobs:
                       with open(target_html, "r", encoding="utf-8") as f:
                           html = f.read()
 
-                      nuclear_script = (
+                      hook_script = (
                           "<script>\n"
                           "(function() {\n"
                           "  try {\n"
-                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
-                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
-                          "    // 终极清理：如果尚未标记强制中文，直接销毁 IndexedDB 与 LocalStorage 中的历史持久化\n"
-                          "    if (localStorage.getItem('photocraft_zh_v1') !== 'true') {\n"
+                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
+                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
+                          "    if (localStorage.getItem('photocraft_zh_hans_v2') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
-                          "      if (window.indexedDB) {\n"
+                          "      if (window.indexedDB && indexedDB.databases) {\n"
                           "        indexedDB.databases().then(function(dbs) {\n"
                           "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
                           "        }).catch(function() {});\n"
                           "      }\n"
-                          "      localStorage.setItem('photocraft_zh_v1', 'true');\n"
+                          "      localStorage.setItem('photocraft_zh_hans_v2', 'true');\n"
                           "    }\n"
                           "    ['photocraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
-                          "      localStorage.setItem(k, 'zh');\n"
+                          "      localStorage.setItem(k, 'zh-hans');\n"
                           "    });\n"
                           "  } catch(e) {}\n"
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html:
-                          html = html.replace("<head>", "<head>\n" + nuclear_script)
+                      if "<head>" in html and "photocraft_zh_hans_v2" not in html:
+                          html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
-                          print(f"✅ 已在 {target_html} 注入重置核弹脚本")
+                          print(f"✅ 已在 {target_html} 注入 zh-Hans 浏览器环境重定向")
           PYEOF
 
-          python3 force_chinese_nuclear.py
-          rm -f force_chinese_nuclear.py
+          python3 patch_zh_hans.py
+          rm -f patch_zh_hans.py
 
       # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
-          CRAFT_DEFAULT_LOCALE: zh
-          CRAFT_DEFAULT_LANG: zh
         run: |
           mkdir -p dist/web
           TARGET_HTML=$(find apps -name "index.html" | head -n 1)
