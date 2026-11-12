@@ -209,7 +209,7 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 极致预压缩 (Gzip -9) + 浏览器原生流式解压注入 + 强缓存规则生成
+      # 8. 深度优化 wasm 并采用 Gzip 预压缩 + 浏览器原生流式解压
       - name: Compress Wasm & Inject Native Streaming Decompression
         run: |
           echo "=== 开始对 WASM 进行 wasm-opt 优化与 Gzip 极限预压缩 ==="
@@ -229,7 +229,6 @@ jobs:
               wasm_filename = os.path.basename(wasm_path)
               print(f"\n--- 正在深度优化: {wasm_filename} ---")
 
-              # 1. wasm-opt 极致精简
               cmd = [
                   "/usr/local/bin/wasm-opt-raw",
                   "--all-features",
@@ -249,7 +248,7 @@ jobs:
                   print(f"wasm-opt 优化跳过: {e}")
                   raw_size = os.path.getsize(wasm_path)
 
-              # 2. 物理 Gzip -9 极限预压缩
+              # 2. 物理 Gzip 极速压缩
               gz_filename = wasm_filename + ".gz"
               gz_path = os.path.join(wasm_dir, gz_filename)
               with open(wasm_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=9) as f_out:
@@ -259,7 +258,6 @@ jobs:
               gz_size_mb = gz_size / (1024 * 1024)
               print(f"Gzip 压缩完成: {gz_filename}，压缩后体积: {gz_size_mb:.2f} MB (原大小: {raw_size/(1024*1024):.2f} MB)")
 
-              # 3. 检查压缩后体积是否满足 Cloudflare Pages 25MB 上限
               chunks = []
               max_safe_limit = 24.0 * 1024 * 1024
               if gz_size > max_safe_limit:
@@ -279,89 +277,61 @@ jobs:
                   chunks = [gz_filename]
                   print(f"✅ 压缩后体积 {gz_size_mb:.2f} MB <= 24MB，无需分片，直接作为单文件发布！")
 
-              # 删除未压缩的大文件，避免触发 CF 25MB 限制
               os.remove(wasm_path)
               print(f"✅ 已清除原始未压缩文件: {wasm_filename}")
 
-              # 4. 改造 index.html，注入浏览器原生流式解压加载器
               html_path = os.path.join(wasm_dir, "index.html")
               if os.path.exists(html_path):
                   with open(html_path, "r", encoding="utf-8") as f:
                       html = f.read()
 
-                  # 移除原始预加载标签（避免控制台 404 报错）
                   html = re.sub(r'<link[^>]*rel="preload"[^>]*' + re.escape(wasm_filename) + r'[^>]*>', '', html)
 
                   parts_json = json.dumps(chunks)
-                  if len(chunks) == 1:
-                      loader_code = f"""<script>
-(function() {{
-  var origFetch = window.fetch;
-  var targetWasm = "{wasm_filename}";
-  var gzFile = "{chunks[0]}";
-  window.fetch = async function() {{
-    var args = Array.prototype.slice.call(arguments);
-    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
-    if (url.indexOf(targetWasm) !== -1) {{
-      console.log('[NativeStream] 正在高速下载单文件压缩包并原生流式解压:', gzFile);
-      var basePath = url.substring(0, url.lastIndexOf('/') + 1);
-      var res = await origFetch(basePath + gzFile);
-      if (!res.ok) throw new Error('WASM 压缩包下载失败: ' + res.status);
-      var decompressedStream = res.body.pipeThrough(new DecompressionStream('gzip'));
-      return new Response(decompressedStream, {{
-        headers: {{ 'Content-Type': 'application/wasm' }}
-      }});
-    }}
-    return origFetch.apply(this, args);
-  }};
-}})();
-</script>"""
-                  else:
-                      loader_code = f"""<script>
-(function() {{
-  var origFetch = window.fetch;
-  var targetWasm = "{wasm_filename}";
-  var parts = {parts_json};
-  window.fetch = async function() {{
-    var args = Array.prototype.slice.call(arguments);
-    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
-    if (url.indexOf(targetWasm) !== -1) {{
-      console.log('[NativeStream] 正在并发获取压缩分片并原生流式解压...');
-      var basePath = url.substring(0, url.lastIndexOf('/') + 1);
-      var buffers = await Promise.all(parts.map(function(p) {{
-        return origFetch(basePath + p).then(function(r) {{
-          if (!r.ok) throw new Error('分片下载失败: ' + p);
-          return r.arrayBuffer();
-        }});
-      }}));
-      var total = buffers.reduce(function(acc, b) {{ return acc + b.byteLength; }}, 0);
-      var mergedGz = new Uint8Array(total);
-      var offset = 0;
-      for (var i = 0; i < buffers.length; i++) {{
-        mergedGz.set(new Uint8Array(buffers[i]), offset);
-        offset += buffers[i].byteLength;
-      }}
-      var gzBlob = new Blob([mergedGz]);
-      var decompressedStream = gzBlob.stream().pipeThrough(new DecompressionStream('gzip'));
-      return new Response(decompressedStream, {{
-        headers: {{ 'Content-Type': 'application/wasm' }}
-      }});
-    }}
-    return origFetch.apply(this, args);
-  }};
-}})();
-</script>"""
+                  fast_loader = (
+                      "<script>\n"
+                      "(function() {\n"
+                      "  var origFetch = window.fetch;\n"
+                      "  var targetWasm = '" + wasm_filename + "';\n"
+                      "  var gzFiles = " + parts_json + ";\n"
+                      "  window.fetch = async function() {\n"
+                      "    var args = Array.prototype.slice.call(arguments);\n"
+                      "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');\n"
+                      "    if (url.indexOf(targetWasm) !== -1) {\n"
+                      "      console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');\n"
+                      "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);\n"
+                      "      var buffers = await Promise.all(gzFiles.map(function(f) {\n"
+                      "        return origFetch(basePath + f).then(function(r) {\n"
+                      "          if (!r.ok) throw new Error('下载失败: ' + f);\n"
+                      "          return r.arrayBuffer();\n"
+                      "        });\n"
+                      "      }));\n"
+                      "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);\n"
+                      "      var mergedGz = new Uint8Array(total);\n"
+                      "      var offset = 0;\n"
+                      "      for (var i = 0; i < buffers.length; i++) {\n"
+                      "        mergedGz.set(new Uint8Array(buffers[i]), offset);\n"
+                      "        offset += buffers[i].byteLength;\n"
+                      "      }\n"
+                      "      var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));\n"
+                      "      return new Response(stream, { headers: { 'Content-Type': 'application/wasm' } });\n"
+                      "    }\n"
+                      "    return origFetch.apply(this, args);\n"
+                      "  };\n"
+                      "})();\n"
+                      "</script>\n"
+                  )
 
                   if "<head>" in html:
-                      html = html.replace("<head>", "<head>\n" + loader_code)
+                      html = html.replace("<head>", "<head>\n" + fast_loader)
                   else:
-                      html = loader_code + "\n" + html
+                      html = fast_loader + "\n" + html
 
                   with open(html_path, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print(f"✅ 已在 {html_path} 中注入原生流式解压脚本")
+                  print("✅ index.html 已更新为流式管道解压引擎")
 
-          # 5. 生成 Cloudflare Pages 强缓存规则文件 (_headers)
+          # 5. 生成 Cloudflare Pages _headers 强缓存规则文件
           headers_content = (
               "/*\n"
               "  Access-Control-Allow-Origin: *\n\n"
