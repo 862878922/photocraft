@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -38,6 +38,8 @@ jobs:
       # 3. Rust 依赖与编译缓存加速
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-rust"
 
       # 4. 安装兼容版 Trunk
       - name: Install Trunk
@@ -56,123 +58,96 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置官方 zh-hans 词库，并将 wasm32 默认语言与 Lang::EN 回退重定向至 zh-hans
+      # 6. 配置 craft-i18n 官方 zh-hans 词库并补丁语言回退解析
       - name: Configure Official zh-hans Locale and Patch Lang Resolution
         run: |
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
           find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
           find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
 
-          # 克隆官方多语言词库（完整保留 locales/zh-hans/*.tsv 原始键值对）
-          rm -rf "$GITHUB_WORKSPACE/craft-i18n"
+          # 1. 克隆官方 craft-i18n 词库仓库，同步中文词条
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
+          cp -r "$GITHUB_WORKSPACE/craft-i18n/locales/zh-hans" "$GITHUB_WORKSPACE/craft-i18n/locales/zh"
 
-          cat << 'PYEOF' > patch_zh_hans.py
+          cat << 'PYEOF' > patch_i18n_locales.py
           import os, re
 
           # 1. 配置 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
-                  lines = f.readlines()
-              filtered = []
-              skip = False
-              for line in lines:
-                  if line.strip().startswith("[profile.release"):
-                      skip = True
-                      continue
-                  if skip and line.strip().startswith("["):
-                      skip = False
-                  if not skip:
-                      filtered.append(line)
+                  content = f.read()
+              new_profile = """[profile.release]
+          opt-level = "z"
+          lto = "fat"
+          codegen-units = 1
+          panic = "abort"
+          strip = true
+          debug = 0
 
-              opt_profile = (
-                  "\n[profile.release]\n"
-                  'opt-level = "z"\n'
-                  'lto = "fat"\n'
-                  "codegen-units = 1\n"
-                  'panic = "abort"\n'
-                  "strip = true\n"
-                  "debug = 0\n"
-              )
-              filtered.append(opt_profile)
+          """
+              content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
               with open(cargo_file, "w", encoding="utf-8") as f:
-                  f.writelines(filtered)
+                  f.write(content)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 验证官方 zh-hans 词库存在
-          i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
-          zh_hans_dir = os.path.join(i18n_repo, "locales", "zh-hans")
-          if os.path.exists(zh_hans_dir):
-              print("✅ 确认官方简体中文词库完整:", os.listdir(zh_hans_dir))
+          # 2. 在 crates/ui-egui/src/i18n.rs 中激活中文
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          if os.path.exists(i18n_rs):
+              with open(i18n_rs, "r", encoding="utf-8") as f:
+                  code = f.read()
+              if '("en", false)' in code and '("zh", false)' not in code:
+                  code = code.replace('("en", false)', '("zh", false),\n    ("zh-hans", false),\n    ("en", false)')
+              if '"en" => "English"' in code and '"zh" =>' not in code:
+                  code = code.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "zh-hans" => "Simplified Chinese",\n        "en" => "English"')
+              with open(i18n_rs, "w", encoding="utf-8") as f:
+                  f.write(code)
 
-          # 3. 修复 crates/ui-egui/src/i18n/system.rs（wasm32 探测与 Lang::EN 默认回退）
-          sys_rs = "crates/ui-egui/src/i18n/system.rs"
-          if os.path.exists(sys_rs):
-              with open(sys_rs, "r", encoding="utf-8") as f:
-                  s = f.read()
-              orig_s = s
+          # 3. 设置默认偏好语言为中文
+          for root, _, files in os.walk("crates"):
+              for file in files:
+                  if file.endswith(".rs"):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, "r", encoding="utf-8") as f:
+                              c = f.read()
+                          orig = c
+                          c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          if c != orig:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(c)
+                      except Exception:
+                          pass
 
-              s = s.replace(
-                  "tags.iter().find_map(|tag| lang_from_tag(tag)).unwrap_or(Lang::EN)",
-                  'tags.iter().find_map(|tag| lang_from_tag(tag)).unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))'
-              )
-              s = re.sub(
-                  r'(#\[cfg\(all\(not\(test\),\s*target_arch\s*=\s*"wasm32"\)\)\]\s*pub\s+fn\s+detect_system_tags\(\)\s*->\s*Vec<String>\s*\{)[^}]*\}',
-                  r'\1 vec!["zh-hans".to_owned()] }',
-                  s
-              )
-              with open(sys_rs, "w", encoding="utf-8") as f:
-                  f.write(s)
-              print("✅ system.rs 中文环境解析修复完毕")
-
-          # 4. 检查 photocraft.tsv
-          i18n_tsv = os.path.join(zh_hans_dir, "photocraft.tsv")
-          if os.path.exists(i18n_tsv):
-              print("✅ 发现 photocraft.tsv 翻译字典")
-
-          # 5. 前端 index.html 注入：清理旧缓存并伪装浏览器语言为 zh-Hans
+          # 4. 锁定浏览器默认语言为中文
           for root, _, files in os.walk("apps"):
               for file in files:
-                  if file == "index.html":
+                  if file.endswith(".html"):
                       target_html = os.path.join(root, file)
-                      with open(target_html, "r", encoding="utf-8") as f:
-                          html = f.read()
-
-                      hook_script = (
-                          "<script>\n"
-                          "(function() {\n"
-                          "  try {\n"
-                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
-                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('photocraft_zh_hans_v3') !== 'true') {\n"
-                          "      localStorage.clear();\n"
-                          "      sessionStorage.clear();\n"
-                          "      if (window.indexedDB && indexedDB.databases) {\n"
-                          "        indexedDB.databases().then(function(dbs) {\n"
-                          "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
-                          "        }).catch(function() {});\n"
-                          "      }\n"
-                          "      localStorage.setItem('photocraft_zh_hans_v3', 'true');\n"
-                          "    }\n"
-                          "    ['photocraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
-                          "      localStorage.setItem(k, 'zh-hans');\n"
-                          "    });\n"
-                          "  } catch(e) {}\n"
-                          "})();\n"
-                          "</script>\n"
-                      )
-                      if "<head>" in html and "photocraft_zh_hans_v3" not in html:
-                          html = html.replace("<head>", "<head>\n" + hook_script)
-                          with open(target_html, "w", encoding="utf-8") as f:
-                              f.write(html)
-                          print(f"✅ 已在 {target_html} 注入 zh-Hans 重定向脚本")
+                      try:
+                          with open(target_html, "r", encoding="utf-8") as f:
+                              html = f.read()
+                          hook_script = (
+                              "<script>\n"
+                              "try {\n"
+                              "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                              "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                              "  ['photocraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) { localStorage.setItem(k, 'zh'); });\n"
+                              "} catch(e) {}\n"
+                              "</script>\n"
+                          )
+                          if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                              html = html.replace("<head>", "<head>\n" + hook_script)
+                              with open(target_html, "w", encoding="utf-8") as f:
+                                  f.write(html)
+                      except Exception:
+                          pass
           PYEOF
+          python3 patch_i18n_locales.py
+          rm -f patch_i18n_locales.py
 
-          python3 patch_zh_hans.py
-          rm -f patch_zh_hans.py
-
-      # 7. 构建 Web 产物
+      # 7. 构建 Web 应用程序
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
@@ -209,10 +184,10 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度优化 wasm 并采用 Gzip 预压缩 + 浏览器原生流式解压
-      - name: Compress Wasm & Inject Native Streaming Decompression
+      # 8. 深度优化 wasm + Gzip 预压缩 + CacheStorage 本地极速秒开 + 50ms 拟真 PS 原生工作台首屏
+      - name: Compress Wasm, Inject CacheStorage & Instant App Shell
         run: |
-          echo "=== 开始对 WASM 进行 wasm-opt 优化与 Gzip 极限预压缩 ==="
+          echo "=== 开始对 WASM 进行 wasm-opt 优化、Gzip 预压缩与拟真工作台首屏注入 ==="
           cat << 'PYEOF' > optimize_and_compress.py
           import os, glob, subprocess, json, gzip, re
 
@@ -261,7 +236,7 @@ jobs:
               chunks = []
               max_safe_limit = 24.0 * 1024 * 1024
               if gz_size > max_safe_limit:
-                  print(f"⚠️ 压缩后文件仍为 {gz_size_mb:.2f} MB (> 24MB)，进行极简两切片...")
+                  print(f"⚠️ 压缩后文件仍为 {gz_size_mb:.2f} MB (> 24MB)，进行轻量切片...")
                   chunk_size = 14 * 1024 * 1024
                   with open(gz_path, "rb") as f:
                       gz_data = f.read()
@@ -288,48 +263,212 @@ jobs:
                   html = re.sub(r'<link[^>]*rel="preload"[^>]*' + re.escape(wasm_filename) + r'[^>]*>', '', html)
 
                   parts_json = json.dumps(chunks)
-                  fast_loader = (
-                      "<script>\n"
-                      "(function() {\n"
-                      "  var origFetch = window.fetch;\n"
-                      "  var targetWasm = '" + wasm_filename + "';\n"
-                      "  var gzFiles = " + parts_json + ";\n"
-                      "  window.fetch = async function() {\n"
-                      "    var args = Array.prototype.slice.call(arguments);\n"
-                      "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');\n"
-                      "    if (url.indexOf(targetWasm) !== -1) {\n"
-                      "      console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');\n"
-                      "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);\n"
-                      "      var buffers = await Promise.all(gzFiles.map(function(f) {\n"
-                      "        return origFetch(basePath + f).then(function(r) {\n"
-                      "          if (!r.ok) throw new Error('下载失败: ' + f);\n"
-                      "          return r.arrayBuffer();\n"
-                      "        });\n"
-                      "      }));\n"
-                      "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);\n"
-                      "      var mergedGz = new Uint8Array(total);\n"
-                      "      var offset = 0;\n"
-                      "      for (var i = 0; i < buffers.length; i++) {\n"
-                      "        mergedGz.set(new Uint8Array(buffers[i]), offset);\n"
-                      "        offset += buffers[i].byteLength;\n"
-                      "      }\n"
-                      "      var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));\n"
-                      "      return new Response(stream, { headers: { 'Content-Type': 'application/wasm' } });\n"
-                      "    }\n"
-                      "    return origFetch.apply(this, args);\n"
-                      "  };\n"
-                      "})();\n"
-                      "</script>\n"
-                  )
+                  fast_loader = f"""<script>
+          (function() {{
+            var origFetch = window.fetch;
+            var targetWasm = "{wasm_filename}";
+            var gzFiles = {parts_json};
+            var CACHE_NAME = 'photocraft-cache-v1';
+
+            window.fetch = async function() {{
+              var args = Array.prototype.slice.call(arguments);
+              var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+              if (url.indexOf(targetWasm) !== -1) {{
+                console.log('[FastLoader] 正在加载 PhotoCraft 图像引擎核心...');
+                var basePath = url.substring(0, url.lastIndexOf('/') + 1);
+                var cache = null;
+                if ('caches' in window) {{
+                  try {{ cache = await caches.open(CACHE_NAME); }} catch(e) {{}}
+                }}
+
+                var buffers = await Promise.all(gzFiles.map(async function(f) {{
+                  var fileUrl = basePath + f;
+                  if (cache) {{
+                    try {{
+                      var match = await cache.match(fileUrl);
+                      if (match) {{
+                        console.log('[FastLoader] 命中 CacheStorage 本地缓存: ' + f);
+                        var p = document.getElementById('shell-step-desc');
+                        if (p) p.innerText = '正在从本地超高速缓存载入 (' + f + ')...';
+                        return match.arrayBuffer();
+                      }}
+                    }} catch(e) {{}}
+                  }}
+                  var resp = await origFetch(fileUrl);
+                  if (!resp.ok) throw new Error('下载失败: ' + f);
+                  if (cache) {{
+                    try {{ cache.put(fileUrl, resp.clone()); }} catch(e) {{}}
+                  }}
+                  return resp.arrayBuffer();
+                }}));
+
+                var total = buffers.reduce(function(acc, b) {{ return acc + b.byteLength; }}, 0);
+                var mergedGz = new Uint8Array(total);
+                var offset = 0;
+                for (var i = 0; i < buffers.length; i++) {{
+                  mergedGz.set(new Uint8Array(buffers[i]), offset);
+                  offset += buffers[i].byteLength;
+                }}
+                var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));
+                return new Response(stream, {{ headers: {{ 'Content-Type': 'application/wasm' }} }});
+              }}
+              return origFetch.apply(this, args);
+            }};
+          }})();
+          </script>"""
 
                   if "<head>" in html:
                       html = html.replace("<head>", "<head>\n" + fast_loader)
                   else:
                       html = fast_loader + "\n" + html
 
+                  # 注入 50ms 拟真 Photoshop 原生工作台首屏 + 时间差操作捕获
+                  app_shell_dom = """
+                  <!-- [Instant App Shell] 50ms 极速拟真首屏 -->
+                  <div id="photocraft-app-shell" style="position:fixed;top:0;left:0;width:100vw;height:100vh;background-color:#1e1e1e;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;z-index:999999;display:flex;flex-direction:column;user-select:none;">
+                    <!-- 顶栏模拟 -->
+                    <div style="height:38px;background:#252526;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid #333333;font-size:13px;justify-content:space-between;">
+                      <div style="display:flex;align-items:center;gap:12px;">
+                        <span style="font-weight:600;color:#38bdf8;display:flex;align-items:center;gap:6px;">
+                          🎨 PhotoCraft 图像设计工作台
+                        </span>
+                        <span style="color:#555;">|</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">文件</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">编辑</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">图像</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">图层</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">滤镜</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">视图</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">窗口</span>
+                        <span style="color:#a0a0a0;cursor:pointer;">帮助</span>
+                      </div>
+                      <div id="engine-status-tag" style="font-size:12px;color:#a0a0a0;display:flex;align-items:center;gap:6px;background:#181818;padding:3px 10px;border-radius:12px;border:1px solid #3c3c3c;">
+                        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;animation:pulse 1.5s infinite;"></span>
+                        <span id="engine-status-text">图像着色核心就绪中...</span>
+                      </div>
+                    </div>
+
+                    <!-- 主工作区模拟 -->
+                    <div style="flex:1;display:flex;position:relative;background:#141414;">
+                      <!-- 左侧 PS 经典工具箱 -->
+                      <div style="width:44px;background:#252526;border-right:1px solid #333;display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:16px;color:#858585;font-size:16px;">
+                        <div title="移动工具" style="cursor:pointer;color:#38bdf8;">⤹</div>
+                        <div title="矩形选框" style="cursor:pointer;">⬚</div>
+                        <div title="魔棒工具" style="cursor:pointer;">🪄</div>
+                        <div title="画笔工具" style="cursor:pointer;">🖌</div>
+                        <div title="仿制印章" style="cursor:pointer;">🩹</div>
+                        <div title="油漆桶/渐变" style="cursor:pointer;">🪣</div>
+                        <div title="裁剪工具" style="cursor:pointer;">✂</div>
+                        <div title="文字工具" style="cursor:pointer;">T</div>
+                      </div>
+
+                      <!-- 中间画布区（带 PS 经典灰白透明棋盘格背景） -->
+                      <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;overflow:hidden;">
+                        <!-- 透明棋盘格背景模拟 -->
+                        <div style="position:absolute;inset:0;background:repeating-conic-gradient(#262626 0% 25%, #1a1a1a 0% 50%) 50% / 20px 20px;opacity:0.6;"></div>
+
+                        <!-- 拟真画布白板阴影 -->
+                        <div style="position:absolute;width:520px;height:380px;background:#1e1e1e;border:1px solid #3a3a3a;box-shadow:0 12px 40px rgba(0,0,0,0.8);border-radius:4px;"></div>
+
+                        <!-- 欢迎引导中心卡片 -->
+                        <div style="position:relative;background:rgba(32,32,32,0.96);border:1px solid #404040;border-radius:8px;padding:28px 36px;box-shadow:0 16px 40px rgba(0,0,0,0.7);text-align:center;max-width:440px;width:90%;backdrop-filter:blur(6px);">
+                          <div style="font-size:20px;font-weight:600;margin-bottom:8px;color:#f8fafc;">欢迎使用 PhotoCraft</div>
+                          <div style="font-size:13px;color:#94a3b8;margin-bottom:24px;">免安装、高保真 Web 图像精修与数字暗房设计工作台</div>
+                          
+                          <div style="display:flex;flex-direction:column;gap:10px;">
+                            <label style="background:#0284c7;color:#fff;padding:10px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;transition:background 0.2s;display:flex;align-items:center;justify-content:center;gap:8px;">
+                              📂 打开本地图片 (JPG / PNG / PSD)
+                              <input type="file" id="shell-file-input" accept="image/*,.psd,.webp" style="display:none;" />
+                            </label>
+                            <button id="shell-new-btn" style="background:#2d2d2d;color:#e2e8f0;border:1px solid #454545;padding:9px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;">
+                              ➕ 新建空白画布 (RGB 300DPI)
+                            </button>
+                            <button id="shell-demo-btn" style="background:transparent;color:#38bdf8;border:none;padding:6px;font-size:13px;cursor:pointer;">
+                              🖼 浏览精选高画质示例图像
+                            </button>
+                          </div>
+
+                          <!-- 进度条提示 -->
+                          <div style="margin-top:24px;border-top:1px solid #333333;padding-top:16px;">
+                            <div style="display:flex;justify-content:space-between;font-size:12px;color:#777777;margin-bottom:6px;">
+                              <span id="shell-step-desc">正在拉取图像渲染引擎...</span>
+                              <span id="shell-progress-num">0%</span>
+                            </div>
+                            <div style="width:100%;height:4px;background:#333333;border-radius:2px;overflow:hidden;">
+                              <div id="shell-progress-bar" style="width:18%;height:100%;background:#0284c7;transition:width 0.3s ease;"></div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- 右侧图层面板拟真 -->
+                      <div style="width:180px;background:#252526;border-left:1px solid #333;display:flex;flex-direction:column;font-size:12px;color:#a0a0a0;">
+                        <div style="height:32px;background:#2d2d2d;display:flex;align-items:center;padding:0 10px;font-weight:600;border-bottom:1px solid #383838;justify-content:space-between;">
+                          <span>图层 (Layers)</span>
+                          <span style="cursor:pointer;">＋</span>
+                        </div>
+                        <div style="padding:8px 10px;display:flex;align-items:center;gap:8px;background:#333842;color:#fff;border-bottom:1px solid #383838;">
+                          <span>👁</span>
+                          <span style="width:18px;height:14px;background:#444;border:1px solid #666;border-radius:2px;"></span>
+                          <span>背景 (锁定)</span>
+                        </div>
+                        <div style="padding:8px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #333;">
+                          <span>👁</span>
+                          <span style="width:18px;height:14px;background:#0284c7;opacity:0.7;border:1px solid #38bdf8;border-radius:2px;"></span>
+                          <span>色彩调节层 1</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <style>
+                  @keyframes pulse {
+                    0%, 100% { opacity: 1; transform: scale(1); }
+                    50% { opacity: 0.4; transform: scale(0.85); }
+                  }
+                  </style>
+                  <script>
+                  // 时间差操作捕获
+                  window._photocraft_stashed_file = null;
+                  window._photocraft_action = null;
+
+                  document.getElementById('shell-file-input').addEventListener('change', function(e) {
+                    if (e.target.files && e.target.files[0]) {
+                      window._photocraft_stashed_file = e.target.files[0];
+                      document.getElementById('shell-step-desc').innerText = "已选择: " + e.target.files[0].name + " (等待引擎启动)";
+                    }
+                  });
+                  document.getElementById('shell-new-btn').addEventListener('click', function() {
+                    window._photocraft_action = 'new';
+                    document.getElementById('shell-step-desc').innerText = "正在为您初始化空白画布...";
+                  });
+                  document.getElementById('shell-demo-btn').addEventListener('click', function() {
+                    window._photocraft_action = 'demo';
+                    document.getElementById('shell-step-desc').innerText = "正在拉取精选示例图...";
+                  });
+
+                  // 核心启动完成后无缝平滑淡出
+                  window.addEventListener('TrunkApplicationStarted', function() {
+                    var shell = document.getElementById('photocraft-app-shell');
+                    if (shell) {
+                      document.getElementById('engine-status-text').innerText = "核心已就绪";
+                      document.getElementById('shell-progress-bar').style.width = "100%";
+                      document.getElementById('shell-progress-num').innerText = "100%";
+                      setTimeout(function() {
+                        shell.style.transition = 'opacity 0.4s ease';
+                        shell.style.opacity = '0';
+                        setTimeout(function() { shell.remove(); }, 400);
+                      }, 150);
+                    }
+                  });
+                  </script>
+                  """
+
+                  if "photocraft-app-shell" not in html:
+                      html = html.replace("<body", app_shell_dom + "\n<body")
+                      print("✅ 已成功将原生工作台首屏注入到 dist/web/index.html")
+
                   with open(html_path, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("✅ index.html 已更新为流式管道解压引擎")
 
           # 5. 生成 Cloudflare Pages _headers 强缓存规则文件
           headers_content = (
@@ -362,8 +501,40 @@ jobs:
 
       # 9. 部署发布到 Cloudflare Pages (lotelf-photo)
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist/web --project-name=lotelf-photo --branch=main --commit-dirty=true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 1. 自动从 Token 探测真实 Account ID
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          # 2. 安装 Wrangler
+          npm install -g wrangler
+
+          # 3. 发布到 Cloudflare Pages (带 5 次自动重试机制，对抗 503 抖动)
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          SUCCESS=0
+
+          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+            echo "🚀 正在发布到 Cloudflare Pages (尝试 $((RETRY_COUNT+1))/$MAX_RETRIES)..."
+            if wrangler pages deploy dist/web --project-name=lotelf-photo --branch=main --commit-dirty=true; then
+              echo "✅ Cloudflare Pages 发布成功！"
+              SUCCESS=1
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "⚠️ 遇到 Cloudflare API 波动或 503，等待 15 秒后进行第 $RETRY_COUNT 次重试..."
+            sleep 15
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "❌ 连续重试 $MAX_RETRIES 次后发布失败，请检查网络或 Cloudflare 状态。"
+            exit 1
+          fi
